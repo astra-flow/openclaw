@@ -82,14 +82,53 @@ export function readSessionMessages(
     return [];
   }
 
-  const lines = fs.readFileSync(filePath, "utf-8").split(/\r?\n/);
+  // NOTE: This is on the Gateway hot path (chat.history). Reading + splitting an entire transcript
+  // file can freeze the UI when a session grows large (or when a single JSONL record is huge).
+  // We therefore tail-read large files and apply a per-line size guard.
+  const MAX_TAIL_BYTES = 2 * 1024 * 1024; // 2MB tail is plenty for the last ~100-1000 messages
+  // 200KB per line: a normal assistant reply is well under 50KB. Anything larger is a runaway
+  // prompt/response that would only stall JSON.parse and bloat the UI — skip it entirely.
+  // (The confirmed 447KB line causing Gateway freezes is caught by this threshold.)
+  const MAX_LINE_CHARS = 200 * 1024;
+
+  let content = "";
+  try {
+    const stat = fs.statSync(filePath);
+    if (stat.size > MAX_TAIL_BYTES) {
+      const fd = fs.openSync(filePath, "r");
+      try {
+        const start = Math.max(0, stat.size - MAX_TAIL_BYTES);
+        const buf = Buffer.allocUnsafe(stat.size - start);
+        fs.readSync(fd, buf, 0, buf.length, start);
+        content = buf.toString("utf-8");
+        // If we started mid-line, drop the partial first line.
+        const firstNewline = content.indexOf("\n");
+        if (firstNewline >= 0 && start > 0) {
+          content = content.slice(firstNewline + 1);
+        }
+      } finally {
+        fs.closeSync(fd);
+      }
+    } else {
+      content = fs.readFileSync(filePath, "utf-8");
+    }
+  } catch {
+    return [];
+  }
+
+  const lines = content.split(/\r?\n/);
   const messages: unknown[] = [];
   for (const line of lines) {
-    if (!line.trim()) {
+    const trimmed = line.trim();
+    if (!trimmed) {
+      continue;
+    }
+    if (trimmed.length > MAX_LINE_CHARS) {
+      // Skip lines that are too large to safely parse on the RPC path.
       continue;
     }
     try {
-      const parsed = JSON.parse(line);
+      const parsed = JSON.parse(trimmed);
       if (parsed?.message) {
         messages.push(parsed.message);
         continue;
