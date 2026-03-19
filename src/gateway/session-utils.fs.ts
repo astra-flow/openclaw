@@ -96,9 +96,9 @@ export function readSessionMessages(
   const MAX_TAIL_BYTES_CAP = 128 * 1024 * 1024; // hard cap to avoid huge reads on the RPC hot path
   const MIN_TAIL_LINES_TARGET = 1500; // heuristic: enough for ~1000 recent messages + headroom
 
-  // 200KB per line: a normal assistant reply is well under 50KB. Anything larger is a runaway
+  // 200KB per line (UTF-8 bytes): a normal assistant reply is well under 50KB. Anything larger is a runaway
   // prompt/response that would only stall JSON.parse and bloat the UI.
-  const MAX_LINE_CHARS = 200 * 1024;
+  const MAX_LINE_BYTES = 200 * 1024;
 
   let content = "";
   try {
@@ -171,11 +171,12 @@ export function readSessionMessages(
     if (!trimmed) {
       continue;
     }
-    if (trimmed.length > MAX_LINE_CHARS) {
+    const trimmedBytes = Buffer.byteLength(trimmed, "utf-8");
+    if (trimmedBytes > MAX_LINE_BYTES) {
       // Preserve history semantics: emit a placeholder entry instead of dropping the line entirely.
       // (chat.history will still apply response-byte caps downstream.)
       console.warn(
-        `[session-utils] oversized transcript line in session ${sessionId}: ${trimmed.length} chars (max ${MAX_LINE_CHARS}); emitting placeholder`,
+        `[session-utils] oversized transcript line in session ${sessionId}: ${trimmedBytes} bytes (max ${MAX_LINE_BYTES}); emitting placeholder`,
       );
       // Best-effort: preserve original role/timestamp without JSON.parse (which would stall).
       // Regex scans are limited to a prefix so we don't do O(n) work over tens/hundreds of MB.
@@ -241,6 +242,7 @@ export function readSessionMessages(
         timestamp,
         __openclaw: {
           kind: "oversized_transcript_line",
+          sizeBytes: trimmedBytes,
           sizeChars: trimmed.length,
           guessed: true,
           looksLikeInlineMedia,
