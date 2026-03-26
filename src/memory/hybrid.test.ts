@@ -1,5 +1,9 @@
 import { describe, expect, it } from "vitest";
-import { bm25RankToScore, buildFtsQuery, mergeHybridResults } from "./hybrid.js";
+import {
+  bm25RankToScore,
+  buildFtsQuery,
+  mergeHybridResults,
+} from "../../extensions/memory-core/src/memory/hybrid.js";
 
 describe("memory hybrid helpers", () => {
   it("buildFtsQuery tokenizes and AND-joins", () => {
@@ -14,7 +18,18 @@ describe("memory hybrid helpers", () => {
     expect(bm25RankToScore(0)).toBeCloseTo(1);
     expect(bm25RankToScore(1)).toBeCloseTo(0.5);
     expect(bm25RankToScore(10)).toBeLessThan(bm25RankToScore(1));
-    expect(bm25RankToScore(-100)).toBeCloseTo(1);
+    expect(bm25RankToScore(-100)).toBeCloseTo(1, 1);
+  });
+
+  it("bm25RankToScore preserves FTS5 BM25 relevance ordering", () => {
+    const strongest = bm25RankToScore(-4.2);
+    const middle = bm25RankToScore(-2.1);
+    const weakest = bm25RankToScore(-0.5);
+
+    expect(strongest).toBeGreaterThan(middle);
+    expect(middle).toBeGreaterThan(weakest);
+    expect(strongest).not.toBe(middle);
+    expect(middle).not.toBe(weakest);
   });
 
   it("mergeHybridResults unions by id and combines weighted scores", async () => {

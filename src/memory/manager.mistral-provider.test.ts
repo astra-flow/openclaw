@@ -2,14 +2,16 @@ import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import type { MemoryIndexManager } from "../../extensions/memory-core/src/memory/index.js";
 import type { OpenClawConfig } from "../config/config.js";
+import { DEFAULT_OLLAMA_EMBEDDING_MODEL } from "./embeddings-ollama.js";
 import type {
   EmbeddingProvider,
   EmbeddingProviderResult,
   MistralEmbeddingClient,
+  OllamaEmbeddingClient,
   OpenAiEmbeddingClient,
 } from "./embeddings.js";
-import { getMemorySearchManager, type MemoryIndexManager } from "./index.js";
 
 const { createEmbeddingProviderMock } = vi.hoisted(() => ({
   createEmbeddingProviderMock: vi.fn(),
@@ -22,6 +24,19 @@ vi.mock("./embeddings.js", () => ({
 vi.mock("./sqlite-vec.js", () => ({
   loadSqliteVecExtension: async () => ({ ok: false, error: "sqlite-vec disabled in tests" }),
 }));
+
+type MemoryIndexModule = typeof import("../../extensions/memory-core/src/memory/index.js");
+
+let getMemorySearchManager: MemoryIndexModule["getMemorySearchManager"];
+let closeAllMemorySearchManagers: MemoryIndexModule["closeAllMemorySearchManagers"];
+
+async function ensureProviderInitialized(manager: MemoryIndexManager): Promise<void> {
+  await (
+    manager as unknown as {
+      ensureProviderInitialized: () => Promise<void>;
+    }
+  ).ensureProviderInitialized();
+}
 
 function createProvider(id: string): EmbeddingProvider {
   return {
@@ -36,7 +51,7 @@ function buildConfig(params: {
   workspaceDir: string;
   indexPath: string;
   provider: "openai" | "mistral";
-  fallback?: "none" | "mistral";
+  fallback?: "none" | "mistral" | "ollama";
 }): OpenClawConfig {
   return {
     agents: {
@@ -62,6 +77,10 @@ describe("memory manager mistral provider wiring", () => {
   let manager: MemoryIndexManager | null = null;
 
   beforeEach(async () => {
+    vi.resetModules();
+    ({ getMemorySearchManager, closeAllMemorySearchManagers } =
+      await import("../../extensions/memory-core/src/memory/index.js"));
+    vi.clearAllMocks();
     createEmbeddingProviderMock.mockReset();
     workspaceDir = await fs.mkdtemp(path.join(os.tmpdir(), "openclaw-memory-mistral-"));
     indexPath = path.join(workspaceDir, "index.sqlite");
@@ -74,6 +93,7 @@ describe("memory manager mistral provider wiring", () => {
       await manager.close();
       manager = null;
     }
+    await closeAllMemorySearchManagers();
     if (workspaceDir) {
       await fs.rm(workspaceDir, { recursive: true, force: true });
       workspaceDir = "";
@@ -100,8 +120,13 @@ describe("memory manager mistral provider wiring", () => {
       throw new Error(`manager missing: ${result.error ?? "no error provided"}`);
     }
     manager = result.manager as unknown as MemoryIndexManager;
+    await ensureProviderInitialized(manager);
 
-    const internal = manager as unknown as { mistral?: MistralEmbeddingClient };
+    const internal = manager as unknown as {
+      ensureProviderInitialized: () => Promise<void>;
+      mistral?: MistralEmbeddingClient;
+    };
+    await internal.ensureProviderInitialized();
     expect(internal.mistral).toBe(mistralClient);
   });
 
@@ -133,15 +158,68 @@ describe("memory manager mistral provider wiring", () => {
       throw new Error(`manager missing: ${result.error ?? "no error provided"}`);
     }
     manager = result.manager as unknown as MemoryIndexManager;
+    await ensureProviderInitialized(manager);
     const internal = manager as unknown as {
+      ensureProviderInitialized: () => Promise<void>;
       activateFallbackProvider: (reason: string) => Promise<boolean>;
       openAi?: OpenAiEmbeddingClient;
       mistral?: MistralEmbeddingClient;
     };
 
+    await internal.ensureProviderInitialized();
     const activated = await internal.activateFallbackProvider("forced test");
     expect(activated).toBe(true);
     expect(internal.openAi).toBeUndefined();
     expect(internal.mistral).toBe(mistralClient);
+  });
+
+  it("uses default ollama model when activating ollama fallback", async () => {
+    const openAiClient: OpenAiEmbeddingClient = {
+      baseUrl: "https://api.openai.com/v1",
+      headers: { authorization: "Bearer openai-key" },
+      model: "text-embedding-3-small",
+    };
+    const ollamaClient: OllamaEmbeddingClient = {
+      baseUrl: "http://127.0.0.1:11434",
+      headers: {},
+      model: DEFAULT_OLLAMA_EMBEDDING_MODEL,
+      embedBatch: async (texts: string[]) => texts.map(() => [0.1, 0.2, 0.3]),
+    };
+    createEmbeddingProviderMock.mockResolvedValueOnce({
+      requestedProvider: "openai",
+      provider: createProvider("openai"),
+      openAi: openAiClient,
+    } as EmbeddingProviderResult);
+    createEmbeddingProviderMock.mockResolvedValueOnce({
+      requestedProvider: "ollama",
+      provider: createProvider("ollama"),
+      ollama: ollamaClient,
+    } as EmbeddingProviderResult);
+
+    const cfg = buildConfig({ workspaceDir, indexPath, provider: "openai", fallback: "ollama" });
+    const result = await getMemorySearchManager({ cfg, agentId: "main" });
+    if (!result.manager) {
+      throw new Error(`manager missing: ${result.error ?? "no error provided"}`);
+    }
+    manager = result.manager as unknown as MemoryIndexManager;
+    await ensureProviderInitialized(manager);
+    const internal = manager as unknown as {
+      ensureProviderInitialized: () => Promise<void>;
+      activateFallbackProvider: (reason: string) => Promise<boolean>;
+      openAi?: OpenAiEmbeddingClient;
+      ollama?: OllamaEmbeddingClient;
+    };
+
+    await internal.ensureProviderInitialized();
+    const activated = await internal.activateFallbackProvider("forced ollama fallback");
+    expect(activated).toBe(true);
+    expect(internal.openAi).toBeUndefined();
+    expect(internal.ollama).toBe(ollamaClient);
+
+    const fallbackCall = createEmbeddingProviderMock.mock.calls[1]?.[0] as
+      | { provider?: string; model?: string }
+      | undefined;
+    expect(fallbackCall?.provider).toBe("ollama");
+    expect(fallbackCall?.model).toBe(DEFAULT_OLLAMA_EMBEDDING_MODEL);
   });
 });
