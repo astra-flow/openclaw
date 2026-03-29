@@ -3,21 +3,29 @@ import os from "node:os";
 import path from "node:path";
 import readline from "node:readline";
 import {
-  buildSessionEntry,
   createSubsystemLogger,
+  resolveAgentWorkspaceDir,
+  resolveGlobalSingleton,
+  resolveStateDir,
+  writeFileWithinRoot,
+  type OpenClawConfig,
+} from "openclaw/plugin-sdk/memory-core-host-engine-foundation";
+import {
+  buildSessionEntry,
   deriveQmdScopeChannel,
   deriveQmdScopeChatType,
   extractKeywords,
-  isFileMissingError,
   isQmdScopeAllowed,
   listSessionFilesForAgent,
   parseQmdQueryJson,
-  requireNodeSqlite,
-  resolveAgentWorkspaceDir,
   resolveCliSpawnInvocation,
-  resolveGlobalSingleton,
-  resolveStateDir,
   runCliCommand,
+  type QmdQueryResult,
+  type SessionFileEntry,
+} from "openclaw/plugin-sdk/memory-core-host-engine-qmd";
+import {
+  isFileMissingError,
+  requireNodeSqlite,
   statRegularFile,
   type MemoryEmbeddingProbeResult,
   type MemoryProviderStatus,
@@ -25,14 +33,10 @@ import {
   type MemorySearchResult,
   type MemorySource,
   type MemorySyncProgressUpdate,
-  type OpenClawConfig,
-  type QmdQueryResult,
   type ResolvedMemoryBackendConfig,
   type ResolvedQmdConfig,
   type ResolvedQmdMcporterConfig,
-  type SessionFileEntry,
-  writeFileWithinRoot,
-} from "../api.js";
+} from "openclaw/plugin-sdk/memory-core-host-engine-storage";
 
 type SqliteDatabase = import("node:sqlite").DatabaseSync;
 
@@ -180,6 +184,7 @@ export class QmdMemoryManager implements MemorySearchManager {
   private readonly maxQmdOutputChars = MAX_QMD_OUTPUT_CHARS;
   private readonly sessionExporter: SessionExporterConfig | null;
   private updateTimer: NodeJS.Timeout | null = null;
+  private embedTimer: NodeJS.Timeout | null = null;
   private pendingUpdate: Promise<void> | null = null;
   private queuedForcedUpdate: Promise<void> | null = null;
   private queuedForcedRuns = 0;
@@ -285,6 +290,13 @@ export class QmdMemoryManager implements MemorySearchManager {
           log.warn(`qmd update failed (${String(err)})`);
         });
       }, this.qmd.update.intervalMs);
+    }
+    if (this.shouldScheduleEmbedTimer()) {
+      this.embedTimer = setInterval(() => {
+        void this.runUpdate("embed-interval").catch((err) => {
+          log.warn(`qmd embed interval update failed (${String(err)})`);
+        });
+      }, this.qmd.update.embedIntervalMs);
     }
   }
 
@@ -981,6 +993,10 @@ export class QmdMemoryManager implements MemorySearchManager {
       clearInterval(this.updateTimer);
       this.updateTimer = null;
     }
+    if (this.embedTimer) {
+      clearInterval(this.embedTimer);
+      this.embedTimer = null;
+    }
     this.queuedForcedRuns = 0;
     await this.pendingUpdate?.catch(() => undefined);
     await this.queuedForcedUpdate?.catch(() => undefined);
@@ -1105,6 +1121,18 @@ export class QmdMemoryManager implements MemorySearchManager {
       this.lastEmbedAt === null ||
       (embedIntervalMs > 0 && now - this.lastEmbedAt > embedIntervalMs)
     );
+  }
+
+  private shouldScheduleEmbedTimer(): boolean {
+    if (this.qmd.searchMode === "search") {
+      return false;
+    }
+    const embedIntervalMs = this.qmd.update.embedIntervalMs;
+    if (embedIntervalMs <= 0) {
+      return false;
+    }
+    const updateIntervalMs = this.qmd.update.intervalMs;
+    return updateIntervalMs <= 0 || updateIntervalMs > embedIntervalMs;
   }
 
   private noteEmbedFailure(reason: string, err: unknown): void {
@@ -1544,6 +1572,13 @@ export class QmdMemoryManager implements MemorySearchManager {
     if (!hints.preferredCollection || !hints.preferredFile) {
       return null;
     }
+    const indexedLocation = this.resolveIndexedDocLocationFromHint(
+      hints.preferredCollection,
+      hints.preferredFile,
+    );
+    if (indexedLocation) {
+      return indexedLocation;
+    }
     const collectionRelativePath = this.toCollectionRelativePath(
       hints.preferredCollection,
       hints.preferredFile,
@@ -1552,6 +1587,45 @@ export class QmdMemoryManager implements MemorySearchManager {
       return null;
     }
     return this.toDocLocation(hints.preferredCollection, collectionRelativePath);
+  }
+
+  private resolveIndexedDocLocationFromHint(
+    collection: string,
+    preferredFile: string,
+  ): { rel: string; abs: string; source: MemorySource } | null {
+    const trimmedCollection = collection.trim();
+    const trimmedFile = preferredFile.trim();
+    if (!trimmedCollection || !trimmedFile) {
+      return null;
+    }
+    const exactPath = path.normalize(trimmedFile).replace(/\\/g, "/");
+    let rows: Array<{ path: string }> = [];
+    try {
+      const db = this.ensureDb();
+      const exactRows = db
+        .prepare("SELECT path FROM documents WHERE collection = ? AND path = ? AND active = 1")
+        .all(trimmedCollection, exactPath) as Array<{ path: string }>;
+      if (exactRows.length > 0) {
+        return this.toDocLocation(trimmedCollection, exactRows[0].path);
+      }
+      rows = db
+        .prepare("SELECT path FROM documents WHERE collection = ? AND active = 1")
+        .all(trimmedCollection) as Array<{ path: string }>;
+    } catch (err) {
+      if (this.isSqliteBusyError(err)) {
+        log.debug(`qmd index is busy while resolving hinted path: ${String(err)}`);
+        throw this.createQmdBusyError(err);
+      }
+      // Hint-based lookup is best effort. Fall back to the raw hinted path when
+      // the index is unavailable or still warming.
+      log.debug(`qmd index hint lookup skipped: ${String(err)}`);
+      return null;
+    }
+    const matches = rows.filter((row) => this.matchesPreferredFileHint(row.path, trimmedFile));
+    if (matches.length !== 1) {
+      return null;
+    }
+    return this.toDocLocation(trimmedCollection, matches[0].path);
   }
 
   private normalizeDocHints(hints?: { preferredCollection?: string; preferredFile?: string }): {
@@ -1633,10 +1707,8 @@ export class QmdMemoryManager implements MemorySearchManager {
       }
     }
     if (hints?.preferredFile) {
-      const preferred = path.normalize(hints.preferredFile);
       for (const row of rows) {
-        const rowPath = path.normalize(row.path);
-        if (rowPath !== preferred && !rowPath.endsWith(path.sep + preferred)) {
+        if (!this.matchesPreferredFileHint(row.path, hints.preferredFile)) {
           continue;
         }
         const location = this.toDocLocation(row.collection, row.path);
@@ -1652,6 +1724,58 @@ export class QmdMemoryManager implements MemorySearchManager {
       }
     }
     return null;
+  }
+
+  private matchesPreferredFileHint(rowPath: string, preferredFile: string): boolean {
+    const preferred = path.normalize(preferredFile).replace(/\\/g, "/");
+    const normalizedRowPath = path.normalize(rowPath).replace(/\\/g, "/");
+    if (normalizedRowPath === preferred || normalizedRowPath.endsWith(`/${preferred}`)) {
+      return true;
+    }
+    const normalizedPreferredLookup = this.normalizeQmdLookupPath(preferredFile);
+    if (!normalizedPreferredLookup) {
+      return false;
+    }
+    const normalizedRowLookup = this.normalizeQmdLookupPath(rowPath);
+    return (
+      normalizedRowLookup === normalizedPreferredLookup ||
+      normalizedRowLookup.endsWith(`/${normalizedPreferredLookup}`)
+    );
+  }
+
+  private normalizeQmdLookupPath(filePath: string): string {
+    return filePath
+      .replace(/\\/g, "/")
+      .split("/")
+      .filter((segment) => segment.length > 0 && segment !== ".")
+      .map((segment) => this.normalizeQmdLookupSegment(segment))
+      .filter(Boolean)
+      .join("/");
+  }
+
+  private normalizeQmdLookupSegment(segment: string): string {
+    const trimmed = segment.trim();
+    if (!trimmed) {
+      return "";
+    }
+    if (trimmed === "." || trimmed === "..") {
+      return trimmed;
+    }
+    const parsed = path.posix.parse(trimmed);
+    const normalizePart = (value: string): string =>
+      value
+        .normalize("NFKD")
+        .toLowerCase()
+        .replace(/[^\p{Letter}\p{Number}]+/gu, "-")
+        .replace(/-{2,}/g, "-")
+        .replace(/^-+|-+$/g, "");
+    const normalizedName = normalizePart(parsed.name);
+    const normalizedExt = parsed.ext
+      .normalize("NFKD")
+      .toLowerCase()
+      .replace(/[^\p{Letter}\p{Number}.]+/gu, "");
+    const fallbackName = parsed.name.normalize("NFKD").toLowerCase().replace(/\s+/g, "-").trim();
+    return `${normalizedName || fallbackName || "file"}${normalizedExt}`;
   }
 
   private extractSnippetLines(snippet: string): { startLine: number; endLine: number } {

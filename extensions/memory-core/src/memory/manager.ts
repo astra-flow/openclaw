@@ -1,31 +1,32 @@
 import type { DatabaseSync } from "node:sqlite";
 import { type FSWatcher } from "chokidar";
 import {
-  createEmbeddingProvider,
-  type EmbeddingProvider,
-  type EmbeddingProviderRequest,
-  type EmbeddingProviderResult,
-  type GeminiEmbeddingClient,
-  type MistralEmbeddingClient,
-  type OllamaEmbeddingClient,
-  type OpenAiEmbeddingClient,
-  type VoyageEmbeddingClient,
-  extractKeywords,
-  readMemoryFile,
   resolveAgentDir,
   resolveAgentWorkspaceDir,
   resolveGlobalSingleton,
   resolveMemorySearchConfig,
+  createSubsystemLogger,
+  type OpenClawConfig,
+  type ResolvedMemorySearchConfig,
+} from "openclaw/plugin-sdk/memory-core-host-engine-foundation";
+import { extractKeywords } from "openclaw/plugin-sdk/memory-core-host-engine-qmd";
+import {
+  readMemoryFile,
   type MemoryEmbeddingProbeResult,
   type MemoryProviderStatus,
   type MemorySearchManager,
   type MemorySearchResult,
   type MemorySource,
   type MemorySyncProgressUpdate,
-  type OpenClawConfig,
-  type ResolvedMemorySearchConfig,
-  createSubsystemLogger,
-} from "../api.js";
+} from "openclaw/plugin-sdk/memory-core-host-engine-storage";
+import {
+  createEmbeddingProvider,
+  type EmbeddingProvider,
+  type EmbeddingProviderId,
+  type EmbeddingProviderRequest,
+  type EmbeddingProviderResult,
+  type EmbeddingProviderRuntime,
+} from "./embeddings.js";
 import { bm25RankToScore, buildFtsQuery, mergeHybridResults } from "./hybrid.js";
 import { MemoryManagerEmbeddingOps } from "./manager-embedding-ops.js";
 import { searchKeyword, searchVector } from "./manager-search.js";
@@ -83,14 +84,10 @@ export class MemoryIndexManager extends MemoryManagerEmbeddingOps implements Mem
   private readonly requestedProvider: EmbeddingProviderRequest;
   private providerInitPromise: Promise<void> | null = null;
   private providerInitialized = false;
-  protected fallbackFrom?: "openai" | "local" | "gemini" | "voyage" | "mistral" | "ollama";
+  protected fallbackFrom?: EmbeddingProviderId;
   protected fallbackReason?: string;
   private providerUnavailableReason?: string;
-  protected openAi?: OpenAiEmbeddingClient;
-  protected gemini?: GeminiEmbeddingClient;
-  protected voyage?: VoyageEmbeddingClient;
-  protected mistral?: MistralEmbeddingClient;
-  protected ollama?: OllamaEmbeddingClient;
+  protected providerRuntime?: EmbeddingProviderRuntime;
   protected batch: {
     enabled: boolean;
     wait: boolean;
@@ -270,11 +267,7 @@ export class MemoryIndexManager extends MemoryManagerEmbeddingOps implements Mem
     this.fallbackFrom = providerResult.fallbackFrom;
     this.fallbackReason = providerResult.fallbackReason;
     this.providerUnavailableReason = providerResult.providerUnavailableReason;
-    this.openAi = providerResult.openAi;
-    this.gemini = providerResult.gemini;
-    this.voyage = providerResult.voyage;
-    this.mistral = providerResult.mistral;
-    this.ollama = providerResult.ollama;
+    this.providerRuntime = providerResult.runtime;
     this.providerInitialized = true;
   }
 
@@ -359,7 +352,9 @@ export class MemoryIndexManager extends MemoryManagerEmbeddingOps implements Mem
 
       // Extract keywords for better FTS matching on conversational queries
       // e.g., "that thing we discussed about the API" → ["discussed", "API"]
-      const keywords = extractKeywords(cleaned);
+      const keywords = extractKeywords(cleaned, {
+        ftsTokenizer: this.settings.store.fts.tokenizer,
+      });
       const searchTerms = keywords.length > 0 ? keywords : [cleaned];
 
       // Search with each keyword and merge results
@@ -378,12 +373,8 @@ export class MemoryIndexManager extends MemoryManagerEmbeddingOps implements Mem
         }
       }
 
-      const merged = [...seenIds.values()]
-        .toSorted((a, b) => b.score - a.score)
-        .filter((entry) => entry.score >= minScore)
-        .slice(0, maxResults);
-
-      return merged;
+      const merged = [...seenIds.values()].toSorted((a, b) => b.score - a.score);
+      return this.selectScoredResults(merged, maxResults, minScore, 0);
     }
 
     // If FTS isn't available, hybrid mode cannot use keyword search; degrade to vector-only.
@@ -425,13 +416,27 @@ export class MemoryIndexManager extends MemoryManagerEmbeddingOps implements Mem
         (entry) => `${entry.source}:${entry.path}:${entry.startLine}:${entry.endLine}`,
       ),
     );
-    return merged
-      .filter(
-        (entry) =>
-          keywordKeys.has(`${entry.source}:${entry.path}:${entry.startLine}:${entry.endLine}`) &&
-          entry.score >= relaxedMinScore,
-      )
-      .slice(0, maxResults);
+    return this.selectScoredResults(
+      merged.filter((entry) =>
+        keywordKeys.has(`${entry.source}:${entry.path}:${entry.startLine}:${entry.endLine}`),
+      ),
+      maxResults,
+      minScore,
+      relaxedMinScore,
+    );
+  }
+
+  private selectScoredResults<T extends MemorySearchResult & { score: number }>(
+    results: T[],
+    maxResults: number,
+    minScore: number,
+    relaxedMinScore = minScore,
+  ): T[] {
+    const strict = results.filter((entry) => entry.score >= minScore);
+    if (strict.length > 0) {
+      return strict.slice(0, maxResults);
+    }
+    return results.filter((entry) => entry.score >= relaxedMinScore).slice(0, maxResults);
   }
 
   private hasIndexedContent(): boolean {
@@ -495,6 +500,7 @@ export class MemoryIndexManager extends MemoryManagerEmbeddingOps implements Mem
       ftsTable: FTS_TABLE,
       providerModel,
       query,
+      ftsTokenizer: this.settings.store.fts.tokenizer,
       limit,
       snippetMaxChars: SNIPPET_MAX_CHARS,
       sourceFilter,

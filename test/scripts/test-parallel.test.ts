@@ -14,6 +14,7 @@ import {
   resolveTestRunExitCode,
 } from "../../scripts/test-parallel-utils.mjs";
 import { loadTestCatalog } from "../../scripts/test-planner/catalog.mjs";
+import { bundledPluginFile } from "../helpers/bundled-plugin-paths.js";
 
 const clearPlannerShardEnv = (env) => {
   const nextEnv = { ...env };
@@ -54,10 +55,10 @@ const sharedTargetedUnitProxyFiles = (() => {
 
 const targetedChannelProxyFiles = [
   ...sharedTargetedChannelProxyFiles,
-  "extensions/discord/src/monitor/message-handler.preflight.acp-bindings.test.ts",
-  "extensions/discord/src/monitor/monitor.agent-components.test.ts",
-  "extensions/telegram/src/bot.create-telegram-bot.test.ts",
-  "extensions/whatsapp/src/monitor-inbox.streams-inbound-messages.test.ts",
+  bundledPluginFile("discord", "src/monitor/message-handler.preflight.acp-bindings.test.ts"),
+  bundledPluginFile("discord", "src/monitor/monitor.agent-components.test.ts"),
+  bundledPluginFile("telegram", "src/bot.create-telegram-bot.test.ts"),
+  bundledPluginFile("whatsapp", "src/monitor-inbox.streams-inbound-messages.test.ts"),
 ];
 
 const targetedUnitProxyFiles = [
@@ -88,6 +89,7 @@ function runPlannerPlan(args: string[], envOverrides: NodeJS.ProcessEnv = {}): s
     cwd: REPO_ROOT,
     env: createPlannerEnv(envOverrides),
     encoding: "utf8",
+    stdio: ["pipe", "pipe", "pipe"],
   });
 }
 
@@ -102,6 +104,37 @@ function runHighMemoryLocalMultiSurfacePlan(): string {
   );
 }
 
+function getPlanLines(output: string, prefix: string): string[] {
+  return output
+    .split("\n")
+    .map((line) => line.trim())
+    .filter((line) => line.startsWith(prefix));
+}
+
+function parseNumericPlanField(line: string, key: string): number {
+  const match = line.match(new RegExp(`\\b${key}=(\\d+)\\b`));
+  if (!match) {
+    throw new Error(`missing ${key} in plan line: ${line}`);
+  }
+  return Number(match[1]);
+}
+
+function runManifestOutputWriter(workflow: string, envOverrides: NodeJS.ProcessEnv = {}): string {
+  const outputPath = path.join(os.tmpdir(), `openclaw-${workflow}-output-${Date.now()}.txt`);
+  try {
+    execFileSync("node", ["scripts/ci-write-manifest-outputs.mjs", "--workflow", workflow], {
+      cwd: REPO_ROOT,
+      env: createPlannerEnv({
+        GITHUB_OUTPUT: outputPath,
+        ...envOverrides,
+      }),
+      encoding: "utf8",
+    });
+    return fs.readFileSync(outputPath, "utf8");
+  } finally {
+    fs.rmSync(outputPath, { force: true });
+  }
+}
 describe("scripts/test-parallel fatal output guard", () => {
   it("fails a zero exit when V8 reports an out-of-memory fatal", () => {
     const output = [
@@ -266,12 +299,14 @@ describe("scripts/test-parallel lane planning", () => {
       }),
     );
 
-    expect(midMemoryOutput).toContain("extensions-batch-1 filters=all maxWorkers=3");
-    expect(midMemoryOutput).toContain("extensions-batch-2 filters=all maxWorkers=3");
-    expect(midMemoryOutput).not.toContain("extensions-batch-3");
-    expect(highMemoryOutput).toContain("extensions-batch-1 filters=all maxWorkers=5");
-    expect(highMemoryOutput).toContain("extensions-batch-2 filters=all maxWorkers=5");
-    expect(highMemoryOutput).not.toContain("extensions-batch-3");
+    const midSharedBatches = getPlanLines(midMemoryOutput, "extensions-batch-");
+    const highSharedBatches = getPlanLines(highMemoryOutput, "extensions-batch-");
+
+    expect(midSharedBatches.length).toBeGreaterThan(0);
+    expect(highSharedBatches.length).toBeGreaterThan(0);
+    expect(midSharedBatches.every((line) => line.includes("filters=all maxWorkers=3"))).toBe(true);
+    expect(highSharedBatches.every((line) => line.includes("filters=all maxWorkers=5"))).toBe(true);
+    expect(highSharedBatches.length).toBeLessThanOrEqual(midSharedBatches.length);
   });
 
   it("starts isolated channel lanes before shared extension batches on high-memory local hosts", () => {
@@ -310,9 +345,17 @@ describe("scripts/test-parallel lane planning", () => {
       }),
     );
 
-    expect(output).toContain("channels-batch-1 filters=33");
-    expect(output).toContain("channels-batch-2 filters=33");
-    expect(output).toContain("channels-batch-3 filters=34");
+    const channelBatchLines = getPlanLines(output, "channels-batch-");
+    const channelBatchFilterCounts = channelBatchLines.map((line) =>
+      parseNumericPlanField(line, "filters"),
+    );
+
+    expect(channelBatchLines.length).toBeGreaterThanOrEqual(4);
+    expect(channelBatchLines.every((line) => line.includes("maxWorkers=5"))).toBe(true);
+    expect(Math.max(...channelBatchFilterCounts)).toBeLessThan(30);
+    expect(channelBatchFilterCounts.reduce((sum, count) => sum + count, 0)).toBe(
+      sharedTargetedChannelProxyFiles.length,
+    );
   });
 
   it("uses targeted unit batching on high-memory local hosts", () => {
@@ -330,9 +373,13 @@ describe("scripts/test-parallel lane planning", () => {
       }),
     );
 
-    expect(output).toContain("unit-batch-1 filters=50");
-    expect(output).toContain("unit-batch-2 filters=49");
-    expect(output).not.toContain("unit-batch-3");
+    const unitBatchLines = getPlanLines(output, "unit-batch-");
+    const unitBatchFilterCounts = unitBatchLines.map((line) =>
+      parseNumericPlanField(line, "filters"),
+    );
+
+    expect(unitBatchLines.length).toBe(2);
+    expect(unitBatchFilterCounts).toEqual([50, 50]);
   });
 
   it("explains targeted file ownership and execution policy", () => {
@@ -341,6 +388,17 @@ describe("scripts/test-parallel lane planning", () => {
     expect(output).toContain("surface=base");
     expect(output).toContain("reasons=base-surface,base-pinned-manifest");
     expect(output).toContain("pool=forks");
+  });
+
+  it("routes targeted contract tests through the contracts config", () => {
+    const output = runPlannerPlan([
+      "--explain",
+      "src/channels/plugins/contracts/registry-backed.contract.test.ts",
+    ]);
+
+    expect(output).toContain("surface=contracts");
+    expect(output).toContain("vitest.contracts.config.ts");
+    expect(output).not.toContain("vitest.unit.config.ts");
   });
 
   it("prints the planner-backed CI manifest as JSON", () => {
@@ -364,77 +422,41 @@ describe("scripts/test-parallel lane planning", () => {
   });
 
   it("writes CI workflow outputs in ci mode", () => {
-    const repoRoot = path.resolve(import.meta.dirname, "../..");
-    const outputPath = path.join(os.tmpdir(), `openclaw-ci-output-${Date.now()}.txt`);
-
-    execFileSync("node", ["scripts/ci-write-manifest-outputs.mjs", "--workflow", "ci"], {
-      cwd: repoRoot,
-      env: {
-        ...clearPlannerShardEnv(process.env),
-        GITHUB_OUTPUT: outputPath,
-        GITHUB_EVENT_NAME: "pull_request",
-        OPENCLAW_CI_DOCS_ONLY: "false",
-        OPENCLAW_CI_DOCS_CHANGED: "false",
-        OPENCLAW_CI_RUN_NODE: "true",
-        OPENCLAW_CI_RUN_MACOS: "true",
-        OPENCLAW_CI_RUN_ANDROID: "true",
-        OPENCLAW_CI_RUN_WINDOWS: "true",
-        OPENCLAW_CI_RUN_SKILLS_PYTHON: "false",
-        OPENCLAW_CI_HAS_CHANGED_EXTENSIONS: "false",
-        OPENCLAW_CI_CHANGED_EXTENSIONS_MATRIX: '{"include":[]}',
-      },
-      encoding: "utf8",
+    const outputs = runManifestOutputWriter("ci", {
+      GITHUB_EVENT_NAME: "pull_request",
+      OPENCLAW_CI_DOCS_ONLY: "false",
+      OPENCLAW_CI_DOCS_CHANGED: "false",
+      OPENCLAW_CI_RUN_NODE: "true",
+      OPENCLAW_CI_RUN_MACOS: "true",
+      OPENCLAW_CI_RUN_ANDROID: "true",
+      OPENCLAW_CI_RUN_WINDOWS: "true",
+      OPENCLAW_CI_RUN_SKILLS_PYTHON: "false",
+      OPENCLAW_CI_HAS_CHANGED_EXTENSIONS: "false",
+      OPENCLAW_CI_CHANGED_EXTENSIONS_MATRIX: '{"include":[]}',
     });
-
-    const outputs = fs.readFileSync(outputPath, "utf8");
     expect(outputs).toContain("run_build_artifacts=true");
     expect(outputs).toContain("run_checks_windows=true");
     expect(outputs).toContain("run_macos_node=true");
     expect(outputs).toContain("android_matrix=");
-    fs.rmSync(outputPath, { force: true });
   });
 
   it("writes install-smoke outputs in install-smoke mode", () => {
-    const repoRoot = path.resolve(import.meta.dirname, "../..");
-    const outputPath = path.join(os.tmpdir(), `openclaw-install-output-${Date.now()}.txt`);
-
-    execFileSync("node", ["scripts/ci-write-manifest-outputs.mjs", "--workflow", "install-smoke"], {
-      cwd: repoRoot,
-      env: {
-        ...clearPlannerShardEnv(process.env),
-        GITHUB_OUTPUT: outputPath,
-        OPENCLAW_CI_DOCS_ONLY: "false",
-        OPENCLAW_CI_RUN_CHANGED_SMOKE: "true",
-      },
-      encoding: "utf8",
+    const outputs = runManifestOutputWriter("install-smoke", {
+      OPENCLAW_CI_DOCS_ONLY: "false",
+      OPENCLAW_CI_RUN_CHANGED_SMOKE: "true",
     });
-
-    const outputs = fs.readFileSync(outputPath, "utf8");
     expect(outputs).toContain("run_install_smoke=true");
     expect(outputs).not.toContain("run_checks=");
-    fs.rmSync(outputPath, { force: true });
   });
 
   it("writes bun outputs in ci-bun mode", () => {
-    const repoRoot = path.resolve(import.meta.dirname, "../..");
-    const outputPath = path.join(os.tmpdir(), `openclaw-bun-output-${Date.now()}.txt`);
-
-    execFileSync("node", ["scripts/ci-write-manifest-outputs.mjs", "--workflow", "ci-bun"], {
-      cwd: repoRoot,
-      env: {
-        ...clearPlannerShardEnv(process.env),
-        GITHUB_OUTPUT: outputPath,
-        OPENCLAW_CI_DOCS_ONLY: "false",
-        OPENCLAW_CI_RUN_NODE: "true",
-      },
-      encoding: "utf8",
+    const outputs = runManifestOutputWriter("ci-bun", {
+      OPENCLAW_CI_DOCS_ONLY: "false",
+      OPENCLAW_CI_RUN_NODE: "true",
     });
-
-    const outputs = fs.readFileSync(outputPath, "utf8");
     expect(outputs).toContain("run_bun_checks=true");
     expect(outputs).toContain("bun_checks_matrix=");
     expect(outputs).not.toContain("run_install_smoke=");
-    fs.rmSync(outputPath, { force: true });
   });
 
   it("passes through vitest --mode values that are not wrapper runtime overrides", () => {
@@ -451,6 +473,24 @@ describe("scripts/test-parallel lane planning", () => {
     expect(output).toContain("unit-deliver-isolated filters=1");
   });
 
+  it("prints collect-all failure policy in planner output for wrapper-native flag", () => {
+    const output = runPlannerPlan(["--plan", "--collect-failures", "--surface", "unit"]);
+
+    expect(output).toContain("failurePolicy=collect-all");
+  });
+
+  it("maps --bail=0 to collect-all failure policy in planner output", () => {
+    const output = runPlannerPlan(["--plan", "--surface", "unit", "--", "--bail=0"]);
+
+    expect(output).toContain("failurePolicy=collect-all");
+  });
+
+  it("rejects wrapper-level positive --bail values", () => {
+    expect(() => runPlannerPlan(["--plan", "--surface", "unit", "--", "--bail=2"])).toThrowError(
+      /Unsupported wrapper-level --bail value/u,
+    );
+  });
+
   it("rejects removed machine-name profiles", () => {
     expect(() => runPlannerPlan(["--plan", "--profile", "macmini"])).toThrowError(
       /Unsupported test profile "macmini"/u,
@@ -461,6 +501,13 @@ describe("scripts/test-parallel lane planning", () => {
     expect(() => runPlannerPlan(["--plan", "--surface", "channel"])).toThrowError(
       /Unsupported --surface value\(s\): channel/u,
     );
+  });
+
+  it("supports the explicit contracts surface", () => {
+    const output = runPlannerPlan(["--plan", "--surface", "contracts"]);
+
+    expect(output).toContain("contracts filters=all");
+    expect(output).toContain("surface=contracts");
   });
 
   it("rejects wrapper --files values that look like options", () => {

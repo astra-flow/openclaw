@@ -5,46 +5,47 @@ import path from "node:path";
 import type { DatabaseSync } from "node:sqlite";
 import chokidar, { FSWatcher } from "chokidar";
 import {
-  DEFAULT_GEMINI_EMBEDDING_MODEL,
-  DEFAULT_MISTRAL_EMBEDDING_MODEL,
-  DEFAULT_OLLAMA_EMBEDDING_MODEL,
-  DEFAULT_OPENAI_EMBEDDING_MODEL,
-  DEFAULT_VOYAGE_EMBEDDING_MODEL,
   buildCaseInsensitiveExtensionGlob,
-  buildFileEntry,
   classifyMemoryMultimodalPath,
-  createEmbeddingProvider,
-  createSubsystemLogger,
-  ensureDir,
-  ensureMemoryIndexSchema,
   getMemoryMultimodalExtensions,
-  hashText,
-  isFileMissingError,
-  listMemoryFiles,
-  listSessionFilesForAgent,
-  loadSqliteVecExtension,
-  normalizeExtraMemoryPaths,
+} from "openclaw/plugin-sdk/memory-core-host-engine-embeddings";
+import {
+  createSubsystemLogger,
   onSessionTranscriptUpdate,
-  requireNodeSqlite,
   resolveAgentDir,
   resolveSessionTranscriptsDirForAgent,
   resolveUserPath,
-  runWithConcurrency,
+  type OpenClawConfig,
+  type ResolvedMemorySearchConfig,
+} from "openclaw/plugin-sdk/memory-core-host-engine-foundation";
+import {
+  buildSessionEntry,
+  listSessionFilesForAgent,
   sessionPathForFile,
+  type SessionFileEntry,
+} from "openclaw/plugin-sdk/memory-core-host-engine-qmd";
+import {
+  buildFileEntry,
+  ensureDir,
+  ensureMemoryIndexSchema,
+  hashText,
+  isFileMissingError,
+  listMemoryFiles,
+  loadSqliteVecExtension,
+  normalizeExtraMemoryPaths,
+  requireNodeSqlite,
+  runWithConcurrency,
   type MemoryFileEntry,
   type MemorySource,
   type MemorySyncProgressUpdate,
-  type OpenClawConfig,
-  type ResolvedMemorySearchConfig,
-  type SessionFileEntry,
+} from "openclaw/plugin-sdk/memory-core-host-engine-storage";
+import {
+  createEmbeddingProvider,
   type EmbeddingProvider,
-  type GeminiEmbeddingClient,
-  type MistralEmbeddingClient,
-  type OllamaEmbeddingClient,
-  type OpenAiEmbeddingClient,
-  type VoyageEmbeddingClient,
-  buildSessionEntry,
-} from "../api.js";
+  type EmbeddingProviderId,
+  type EmbeddingProviderRuntime,
+  resolveEmbeddingProviderFallbackModel,
+} from "./embeddings.js";
 
 type MemoryIndexMeta = {
   model: string;
@@ -55,6 +56,7 @@ type MemoryIndexMeta = {
   chunkTokens: number;
   chunkOverlap: number;
   vectorDims?: number;
+  ftsTokenizer?: string;
 };
 
 type MemorySyncProgressState = {
@@ -101,12 +103,8 @@ export abstract class MemoryManagerSyncOps {
   protected abstract readonly workspaceDir: string;
   protected abstract readonly settings: ResolvedMemorySearchConfig;
   protected provider: EmbeddingProvider | null = null;
-  protected fallbackFrom?: "openai" | "local" | "gemini" | "voyage" | "mistral" | "ollama";
-  protected openAi?: OpenAiEmbeddingClient;
-  protected gemini?: GeminiEmbeddingClient;
-  protected voyage?: VoyageEmbeddingClient;
-  protected mistral?: MistralEmbeddingClient;
-  protected ollama?: OllamaEmbeddingClient;
+  protected fallbackFrom?: EmbeddingProviderId;
+  protected providerRuntime?: EmbeddingProviderRuntime;
   protected abstract batch: {
     enabled: boolean;
     wait: boolean;
@@ -365,6 +363,7 @@ export abstract class MemoryManagerSyncOps {
       cacheEnabled: this.cache.enabled,
       ftsTable: FTS_TABLE,
       ftsEnabled: this.fts.enabled,
+      ftsTokenizer: this.settings.store.fts.tokenizer,
     });
     this.fts.available = result.ftsAvailable;
     if (result.ftsError) {
@@ -695,11 +694,6 @@ export abstract class MemoryManagerSyncOps {
     needsFullReindex: boolean;
     progress?: MemorySyncProgressState;
   }) {
-    // FTS-only mode: skip embedding sync (no provider)
-    if (!this.provider) {
-      log.debug("Skipping memory file sync in FTS-only mode (no embedding provider)");
-      return;
-    }
     const selectSourceFileState = this.db.prepare(`SELECT path, hash FROM files WHERE source = ?`);
     const deleteFileByPathAndSource = this.db.prepare(
       `DELETE FROM files WHERE path = ? AND source = ?`,
@@ -713,9 +707,9 @@ export abstract class MemoryManagerSyncOps {
             `DELETE FROM ${VECTOR_TABLE} WHERE id IN (SELECT id FROM chunks WHERE path = ? AND source = ?)`,
           )
         : null;
-    const deleteFtsRowsByPathSourceAndModel =
+    const deleteFtsRowsByPathAndSource =
       this.fts.enabled && this.fts.available
-        ? this.db.prepare(`DELETE FROM ${FTS_TABLE} WHERE path = ? AND source = ? AND model = ?`)
+        ? this.db.prepare(`DELETE FROM ${FTS_TABLE} WHERE path = ? AND source = ?`)
         : null;
 
     const files = await listMemoryFiles(
@@ -786,9 +780,9 @@ export abstract class MemoryManagerSyncOps {
         } catch {}
       }
       deleteChunksByPathAndSource.run(stale.path, "memory");
-      if (deleteFtsRowsByPathSourceAndModel) {
+      if (deleteFtsRowsByPathAndSource) {
         try {
-          deleteFtsRowsByPathSourceAndModel.run(stale.path, "memory", this.provider.model);
+          deleteFtsRowsByPathAndSource.run(stale.path, "memory");
         } catch {}
       }
     }
@@ -799,11 +793,6 @@ export abstract class MemoryManagerSyncOps {
     targetSessionFiles?: string[];
     progress?: MemorySyncProgressState;
   }) {
-    // FTS-only mode: skip embedding sync (no provider)
-    if (!this.provider) {
-      log.debug("Skipping session file sync in FTS-only mode (no embedding provider)");
-      return;
-    }
     const selectFileHash = this.db.prepare(`SELECT hash FROM files WHERE path = ? AND source = ?`);
     const selectSourceFileState = this.db.prepare(`SELECT path, hash FROM files WHERE source = ?`);
     const deleteFileByPathAndSource = this.db.prepare(
@@ -933,7 +922,11 @@ export abstract class MemoryManagerSyncOps {
       deleteChunksByPathAndSource.run(stale.path, "sessions");
       if (deleteFtsRowsByPathSourceAndModel) {
         try {
-          deleteFtsRowsByPathSourceAndModel.run(stale.path, "sessions", this.provider.model);
+          deleteFtsRowsByPathSourceAndModel.run(
+            stale.path,
+            "sessions",
+            this.provider?.model ?? "fts-only",
+          );
         } catch {}
       }
     }
@@ -1024,14 +1017,16 @@ export abstract class MemoryManagerSyncOps {
     const needsFullReindex =
       (params?.force && !hasTargetSessionFiles) ||
       !meta ||
-      (this.provider && meta.model !== this.provider.model) ||
-      (this.provider && meta.provider !== this.provider.id) ||
+      // Also detects provider→FTS-only transitions so orphaned old-model FTS rows are cleaned up.
+      (this.provider ? meta.model !== this.provider.model : meta.model !== "fts-only") ||
+      (this.provider ? meta.provider !== this.provider.id : meta.provider !== "none") ||
       meta.providerKey !== this.providerKey ||
       this.metaSourcesDiffer(meta, configuredSources) ||
       meta.scopeHash !== configuredScopeHash ||
       meta.chunkTokens !== this.settings.chunking.tokens ||
       meta.chunkOverlap !== this.settings.chunking.overlap ||
-      (vectorReady && !meta?.vectorDims);
+      (vectorReady && !meta?.vectorDims) ||
+      (meta.ftsTokenizer ?? "unicode61") !== this.settings.store.fts.tokenizer;
     try {
       if (needsFullReindex) {
         if (
@@ -1104,13 +1099,7 @@ export abstract class MemoryManagerSyncOps {
     timeoutMs: number;
   } {
     const batch = this.settings.remote?.batch;
-    const enabled = Boolean(
-      batch?.enabled &&
-      this.provider &&
-      ((this.openAi && this.provider.id === "openai") ||
-        (this.gemini && this.provider.id === "gemini") ||
-        (this.voyage && this.provider.id === "voyage")),
-    );
+    const enabled = Boolean(batch?.enabled && this.provider && this.providerRuntime?.batchEmbed);
     return {
       enabled,
       wait: batch?.wait ?? true,
@@ -1128,26 +1117,9 @@ export abstract class MemoryManagerSyncOps {
     if (this.fallbackFrom) {
       return false;
     }
-    const fallbackFrom = this.provider.id as
-      | "openai"
-      | "gemini"
-      | "local"
-      | "voyage"
-      | "mistral"
-      | "ollama";
+    const fallbackFrom = this.provider.id as EmbeddingProviderId;
 
-    const fallbackModel =
-      fallback === "gemini"
-        ? DEFAULT_GEMINI_EMBEDDING_MODEL
-        : fallback === "openai"
-          ? DEFAULT_OPENAI_EMBEDDING_MODEL
-          : fallback === "voyage"
-            ? DEFAULT_VOYAGE_EMBEDDING_MODEL
-            : fallback === "mistral"
-              ? DEFAULT_MISTRAL_EMBEDDING_MODEL
-              : fallback === "ollama"
-                ? DEFAULT_OLLAMA_EMBEDDING_MODEL
-                : this.settings.model;
+    const fallbackModel = resolveEmbeddingProviderFallbackModel(fallback, this.settings.model);
 
     const fallbackResult = await createEmbeddingProvider({
       config: this.cfg,
@@ -1163,11 +1135,7 @@ export abstract class MemoryManagerSyncOps {
     this.fallbackFrom = fallbackFrom;
     this.fallbackReason = reason;
     this.provider = fallbackResult.provider;
-    this.openAi = fallbackResult.openAi;
-    this.gemini = fallbackResult.gemini;
-    this.voyage = fallbackResult.voyage;
-    this.mistral = fallbackResult.mistral;
-    this.ollama = fallbackResult.ollama;
+    this.providerRuntime = fallbackResult.runtime;
     this.providerKey = this.computeProviderKey();
     this.batch = this.resolveBatchConfig();
     log.warn(`memory embeddings: switched to fallback provider (${fallback})`, { reason });
@@ -1250,6 +1218,7 @@ export abstract class MemoryManagerSyncOps {
         scopeHash: this.resolveConfiguredScopeHash(),
         chunkTokens: this.settings.chunking.tokens,
         chunkOverlap: this.settings.chunking.overlap,
+        ftsTokenizer: this.settings.store.fts.tokenizer,
       };
       if (!nextMeta) {
         throw new Error("Failed to compute memory index metadata for reindexing.");
@@ -1322,6 +1291,7 @@ export abstract class MemoryManagerSyncOps {
       scopeHash: this.resolveConfiguredScopeHash(),
       chunkTokens: this.settings.chunking.tokens,
       chunkOverlap: this.settings.chunking.overlap,
+      ftsTokenizer: this.settings.store.fts.tokenizer,
     };
     if (this.vector.available && this.vector.dims) {
       nextMeta.vectorDims = this.vector.dims;
@@ -1336,9 +1306,10 @@ export abstract class MemoryManagerSyncOps {
     this.db.exec(`DELETE FROM chunks`);
     if (this.fts.enabled && this.fts.available) {
       try {
-        this.db.exec(`DELETE FROM ${FTS_TABLE}`);
+        this.db.exec(`DROP TABLE IF EXISTS ${FTS_TABLE}`);
       } catch {}
     }
+    this.ensureSchema();
     this.dropVectorTable();
     this.vector.dims = undefined;
     this.sessionsDirtyFiles.clear();
