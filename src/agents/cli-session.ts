@@ -1,14 +1,12 @@
 import crypto from "node:crypto";
 import type { CliSessionBinding, SessionEntry } from "../config/sessions.js";
+import { normalizeOptionalString } from "../shared/string-coerce.js";
 import { normalizeProviderId } from "./model-selection.js";
 
-function trimOptional(value: string | undefined): string | undefined {
-  const trimmed = value?.trim();
-  return trimmed ? trimmed : undefined;
-}
+const CLAUDE_CLI_BACKEND_ID = "claude-cli";
 
 export function hashCliSessionText(value: string | undefined): string | undefined {
-  const trimmed = trimOptional(value);
+  const trimmed = normalizeOptionalString(value);
   if (!trimmed) {
     return undefined;
   }
@@ -24,21 +22,23 @@ export function getCliSessionBinding(
   }
   const normalized = normalizeProviderId(provider);
   const fromBindings = entry.cliSessionBindings?.[normalized];
-  const bindingSessionId = trimOptional(fromBindings?.sessionId);
+  const bindingSessionId = normalizeOptionalString(fromBindings?.sessionId);
   if (bindingSessionId) {
     return {
       sessionId: bindingSessionId,
-      authProfileId: trimOptional(fromBindings?.authProfileId),
-      extraSystemPromptHash: trimOptional(fromBindings?.extraSystemPromptHash),
-      mcpConfigHash: trimOptional(fromBindings?.mcpConfigHash),
+      authProfileId: normalizeOptionalString(fromBindings?.authProfileId),
+      authEpoch: normalizeOptionalString(fromBindings?.authEpoch),
+      extraSystemPromptHash: normalizeOptionalString(fromBindings?.extraSystemPromptHash),
+      mcpConfigHash: normalizeOptionalString(fromBindings?.mcpConfigHash),
     };
   }
   const fromMap = entry.cliSessionIds?.[normalized];
-  if (fromMap?.trim()) {
-    return { sessionId: fromMap.trim() };
+  const normalizedFromMap = normalizeOptionalString(fromMap);
+  if (normalizedFromMap) {
+    return { sessionId: normalizedFromMap };
   }
-  if (normalized === "claude-cli") {
-    const legacy = entry.claudeCliSessionId?.trim();
+  if (normalized === CLAUDE_CLI_BACKEND_ID) {
+    const legacy = normalizeOptionalString(entry.claudeCliSessionId);
     if (legacy) {
       return { sessionId: legacy };
     }
@@ -71,19 +71,22 @@ export function setCliSessionBinding(
     ...entry.cliSessionBindings,
     [normalized]: {
       sessionId: trimmed,
-      ...(trimOptional(binding.authProfileId)
-        ? { authProfileId: trimOptional(binding.authProfileId) }
+      ...(normalizeOptionalString(binding.authProfileId)
+        ? { authProfileId: normalizeOptionalString(binding.authProfileId) }
         : {}),
-      ...(trimOptional(binding.extraSystemPromptHash)
-        ? { extraSystemPromptHash: trimOptional(binding.extraSystemPromptHash) }
+      ...(normalizeOptionalString(binding.authEpoch)
+        ? { authEpoch: normalizeOptionalString(binding.authEpoch) }
         : {}),
-      ...(trimOptional(binding.mcpConfigHash)
-        ? { mcpConfigHash: trimOptional(binding.mcpConfigHash) }
+      ...(normalizeOptionalString(binding.extraSystemPromptHash)
+        ? { extraSystemPromptHash: normalizeOptionalString(binding.extraSystemPromptHash) }
+        : {}),
+      ...(normalizeOptionalString(binding.mcpConfigHash)
+        ? { mcpConfigHash: normalizeOptionalString(binding.mcpConfigHash) }
         : {}),
     },
   };
   entry.cliSessionIds = { ...entry.cliSessionIds, [normalized]: trimmed };
-  if (normalized === "claude-cli") {
+  if (normalized === CLAUDE_CLI_BACKEND_ID) {
     entry.claudeCliSessionId = trimmed;
   }
 }
@@ -100,7 +103,7 @@ export function clearCliSession(entry: SessionEntry, provider: string): void {
     delete next[normalized];
     entry.cliSessionIds = Object.keys(next).length > 0 ? next : undefined;
   }
-  if (normalized === "claude-cli") {
+  if (normalized === CLAUDE_CLI_BACKEND_ID) {
     delete entry.claudeCliSessionId;
   }
 }
@@ -114,27 +117,36 @@ export function clearAllCliSessions(entry: SessionEntry): void {
 export function resolveCliSessionReuse(params: {
   binding?: CliSessionBinding;
   authProfileId?: string;
+  authEpoch?: string;
   extraSystemPromptHash?: string;
   mcpConfigHash?: string;
-}): { sessionId?: string; invalidatedReason?: "auth-profile" | "system-prompt" | "mcp" } {
+}): {
+  sessionId?: string;
+  invalidatedReason?: "auth-profile" | "auth-epoch" | "system-prompt" | "mcp";
+} {
   const binding = params.binding;
-  const sessionId = trimOptional(binding?.sessionId);
+  const sessionId = normalizeOptionalString(binding?.sessionId);
   if (!sessionId) {
     return {};
   }
-  const currentAuthProfileId = trimOptional(params.authProfileId);
-  const currentExtraSystemPromptHash = trimOptional(params.extraSystemPromptHash);
-  const currentMcpConfigHash = trimOptional(params.mcpConfigHash);
-  if (binding?.authProfileId && trimOptional(binding.authProfileId) !== currentAuthProfileId) {
+  const currentAuthProfileId = normalizeOptionalString(params.authProfileId);
+  const currentAuthEpoch = normalizeOptionalString(params.authEpoch);
+  const currentExtraSystemPromptHash = normalizeOptionalString(params.extraSystemPromptHash);
+  const currentMcpConfigHash = normalizeOptionalString(params.mcpConfigHash);
+  const storedAuthProfileId = normalizeOptionalString(binding?.authProfileId);
+  if (storedAuthProfileId !== currentAuthProfileId) {
     return { invalidatedReason: "auth-profile" };
   }
-  if (
-    binding?.extraSystemPromptHash &&
-    trimOptional(binding.extraSystemPromptHash) !== currentExtraSystemPromptHash
-  ) {
+  const storedAuthEpoch = normalizeOptionalString(binding?.authEpoch);
+  if (storedAuthEpoch !== currentAuthEpoch) {
+    return { invalidatedReason: "auth-epoch" };
+  }
+  const storedExtraSystemPromptHash = normalizeOptionalString(binding?.extraSystemPromptHash);
+  if (storedExtraSystemPromptHash !== currentExtraSystemPromptHash) {
     return { invalidatedReason: "system-prompt" };
   }
-  if (binding?.mcpConfigHash && trimOptional(binding.mcpConfigHash) !== currentMcpConfigHash) {
+  const storedMcpConfigHash = normalizeOptionalString(binding?.mcpConfigHash);
+  if (storedMcpConfigHash !== currentMcpConfigHash) {
     return { invalidatedReason: "mcp" };
   }
   return { sessionId };

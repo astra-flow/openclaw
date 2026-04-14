@@ -1,6 +1,12 @@
 {
   "id": "deepgram",
-  "mediaUnderstandingProviders": ["deepgram"],
+  "enabledByDefault": true,
+  "providerAuthEnvVars": {
+    "deepgram": ["DEEPGRAM_API_KEY"]
+  },
+  "contracts": {
+    "mediaUnderstandingProviders": ["deepgram"]
+  },
   "configSchema": {
     "type": "object",
     "additionalProperties": false,

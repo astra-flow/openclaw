@@ -2,15 +2,15 @@ import { inspect } from "node:util";
 import {
   Client,
   RateLimitError,
-  ReadyListener,
   type BaseCommand,
   type BaseMessageInteractiveComponent,
   type Modal,
-  type Plugin,
 } from "@buape/carbon";
 import { GatewayCloseCodes, type GatewayPlugin } from "@buape/carbon/gateway";
-import { VoicePlugin } from "@buape/carbon/voice";
 import { Routes } from "discord-api-types/v10";
+import { CHANNEL_APPROVAL_NATIVE_RUNTIME_CONTEXT_CAPABILITY } from "openclaw/plugin-sdk/approval-handler-adapter-runtime";
+import type { ChannelRuntimeSurface } from "openclaw/plugin-sdk/channel-contract";
+import { registerChannelRuntimeContext } from "openclaw/plugin-sdk/channel-runtime-context";
 import {
   listNativeCommandSpecsForConfig,
   listSkillCommandsForAgents,
@@ -23,17 +23,9 @@ import {
 } from "openclaw/plugin-sdk/config-runtime";
 import type { OpenClawConfig, ReplyToMode } from "openclaw/plugin-sdk/config-runtime";
 import { loadConfig } from "openclaw/plugin-sdk/config-runtime";
-import { isDangerousNameMatchingEnabled } from "openclaw/plugin-sdk/config-runtime";
-import {
-  GROUP_POLICY_BLOCKED_LABEL,
-  resolveOpenProviderRuntimeGroupPolicy,
-  resolveDefaultGroupPolicy,
-  warnMissingProviderGroupPolicyFallbackOnce,
-} from "openclaw/plugin-sdk/config-runtime";
 import { createConnectedChannelStatusPatch } from "openclaw/plugin-sdk/gateway-runtime";
-import { formatErrorMessage } from "openclaw/plugin-sdk/infra-runtime";
 import { getPluginCommandSpecs } from "openclaw/plugin-sdk/plugin-runtime";
-import { resolveTextChunkLimit } from "openclaw/plugin-sdk/reply-runtime";
+import { resolveTextChunkLimit } from "openclaw/plugin-sdk/reply-chunking";
 import {
   danger,
   isVerbose,
@@ -43,9 +35,21 @@ import {
 } from "openclaw/plugin-sdk/runtime-env";
 import { createSubsystemLogger } from "openclaw/plugin-sdk/runtime-env";
 import { createNonExitingRuntime, type RuntimeEnv } from "openclaw/plugin-sdk/runtime-env";
-import { summarizeStringEntries } from "openclaw/plugin-sdk/text-runtime";
+import {
+  GROUP_POLICY_BLOCKED_LABEL,
+  resolveOpenProviderRuntimeGroupPolicy,
+  resolveDefaultGroupPolicy,
+  warnMissingProviderGroupPolicyFallbackOnce,
+} from "openclaw/plugin-sdk/runtime-group-policy";
+import { formatErrorMessage } from "openclaw/plugin-sdk/ssrf-runtime";
+import {
+  normalizeLowercaseStringOrEmpty,
+  summarizeStringEntries,
+} from "openclaw/plugin-sdk/text-runtime";
 import { resolveDiscordAccount } from "../accounts.js";
+import { isDiscordExecApprovalClientEnabled } from "../exec-approvals.js";
 import { fetchDiscordApplicationId } from "../probe.js";
+import { resolveDiscordProxyFetchForAccount } from "../proxy-fetch.js";
 import { normalizeDiscordToken } from "../token.js";
 import { createDiscordVoiceCommand } from "../voice/command.js";
 import {
@@ -61,26 +65,27 @@ import {
 } from "./agent-components.js";
 import { createDiscordAutoPresenceController } from "./auto-presence.js";
 import { resolveDiscordSlashCommandConfig } from "./commands.js";
-import { createExecApprovalButton, DiscordExecApprovalHandler } from "./exec-approvals.js";
+import {
+  createExecApprovalButton,
+  createDiscordExecApprovalButtonContext,
+} from "./exec-approvals.js";
+import type { MutableDiscordGateway } from "./gateway-handle.js";
 import { createDiscordGatewayPlugin } from "./gateway-plugin.js";
 import { createDiscordGatewaySupervisor } from "./gateway-supervisor.js";
-import {
-  DiscordMessageListener,
-  DiscordPresenceListener,
-  DiscordReactionListener,
-  DiscordReactionRemoveListener,
-  DiscordThreadUpdateListener,
-  registerDiscordListener,
-} from "./listeners.js";
+import { registerDiscordListener } from "./listeners.js";
 import {
   createDiscordCommandArgFallbackButton,
   createDiscordModelPickerFallbackButton,
   createDiscordModelPickerFallbackSelect,
   createDiscordNativeCommand,
 } from "./native-command.js";
-import { resolveDiscordPresenceUpdate } from "./presence.js";
 import { resolveDiscordAllowlistConfig } from "./provider.allowlist.js";
 import { runDiscordGatewayLifecycle } from "./provider.lifecycle.js";
+import {
+  createDiscordMonitorClient,
+  fetchDiscordBotIdentity,
+  registerDiscordMonitorListeners,
+} from "./provider.startup.js";
 import { resolveDiscordRestFetch } from "./rest-fetch.js";
 import { formatDiscordStartupStatusMessage } from "./startup-status.js";
 import type { DiscordMonitorStatusSink } from "./status.js";
@@ -91,12 +96,15 @@ export type MonitorDiscordOpts = {
   accountId?: string;
   config?: OpenClawConfig;
   runtime?: RuntimeEnv;
+  channelRuntime?: ChannelRuntimeSurface;
   abortSignal?: AbortSignal;
   mediaMaxMb?: number;
   historyLimit?: number;
   replyToMode?: ReplyToMode;
   setStatus?: DiscordMonitorStatusSink;
 };
+
+const DEFAULT_DISCORD_MEDIA_MAX_MB = 100;
 
 type DiscordVoiceManager = import("../voice/manager.js").DiscordVoiceManager;
 
@@ -176,12 +184,12 @@ function appendPluginCommandSpecs(params: {
 }): NativeCommandSpec[] {
   const merged = [...params.commandSpecs];
   const existingNames = new Set(
-    merged.map((spec) => spec.name.trim().toLowerCase()).filter(Boolean),
+    merged.map((spec) => normalizeLowercaseStringOrEmpty(spec.name)).filter(Boolean),
   );
   for (const pluginCommand of (getPluginCommandSpecsForTesting ?? getPluginCommandSpecs)(
     "discord",
   )) {
-    const normalizedName = pluginCommand.name.trim().toLowerCase();
+    const normalizedName = normalizeLowercaseStringOrEmpty(pluginCommand.name);
     if (!normalizedName) {
       continue;
     }
@@ -225,7 +233,7 @@ function classifyAcpStatusProbeError(params: {
     return { status: "stale", reason: "session-init-failed" };
   }
 
-  const message = params.error instanceof Error ? params.error.message : String(params.error);
+  const message = formatErrorMessage(params.error);
   if (isLegacyMissingSessionError(message)) {
     return { status: "stale", reason: "session-missing" };
   }
@@ -360,7 +368,7 @@ async function deployDiscordCommands(params: {
       // errors like Discord 30034 fail fast and don't wedge the provider.
       restClient.options.queueRequests = false;
     }
-    params.runtime.log?.("discord: native commands using Carbon reconcile path");
+    logVerbose("discord: native commands using Carbon reconcile path");
     for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
       try {
         await params.client.handleDeployRequest();
@@ -597,6 +605,7 @@ export async function monitorDiscordProvider(opts: MonitorDiscordOpts = {}) {
   const discordAccountThreadBindings =
     cfg.channels?.discord?.accounts?.[account.accountId]?.threadBindings;
   const discordRestFetch = resolveDiscordRestFetch(rawDiscordCfg.proxy, runtime);
+  const discordProxyFetch = resolveDiscordProxyFetchForAccount(account, cfg, runtime);
   const dmConfig = rawDiscordCfg.dm;
   let guildEntries = rawDiscordCfg.guilds;
   const defaultGroupPolicy = resolveDefaultGroupPolicy(cfg);
@@ -616,7 +625,8 @@ export async function monitorDiscordProvider(opts: MonitorDiscordOpts = {}) {
     log: (message) => runtime.log?.(warn(message)),
   });
   let allowFrom = discordCfg.allowFrom ?? dmConfig?.allowFrom;
-  const mediaMaxBytes = (opts.mediaMaxMb ?? discordCfg.mediaMaxMb ?? 8) * 1024 * 1024;
+  const mediaMaxBytes =
+    (opts.mediaMaxMb ?? discordCfg.mediaMaxMb ?? DEFAULT_DISCORD_MEDIA_MAX_MB) * 1024 * 1024;
   const textLimit = resolveTextChunkLimit(cfg, "discord", account.accountId, {
     fallbackLimit: 2000,
   });
@@ -796,8 +806,10 @@ export async function monitorDiscordProvider(opts: MonitorDiscordOpts = {}) {
   let lifecycleStarted = false;
   let gatewaySupervisor: ReturnType<typeof createDiscordGatewaySupervisor> | undefined;
   let deactivateMessageHandler: (() => void) | undefined;
-  let autoPresenceController: ReturnType<typeof createDiscordAutoPresenceController> | null = null;
-  let lifecycleGateway: GatewayPlugin | undefined;
+  let autoPresenceController: ReturnType<
+    typeof createDiscordMonitorClient
+  >["autoPresenceController"] = null;
+  let lifecycleGateway: MutableDiscordGateway | undefined;
   let earlyGatewayEmitter = gatewaySupervisor?.emitter;
   let onEarlyGatewayDebug: ((msg: unknown) => void) | undefined;
   try {
@@ -828,15 +840,24 @@ export async function monitorDiscordProvider(opts: MonitorDiscordOpts = {}) {
 
     // Initialize exec approvals handler if enabled
     const execApprovalsConfig = discordCfg.execApprovals ?? {};
-    const execApprovalsHandler = execApprovalsConfig.enabled
-      ? new DiscordExecApprovalHandler({
+    const execApprovalsEnabled = isDiscordExecApprovalClientEnabled({
+      cfg,
+      accountId: account.accountId,
+      configOverride: execApprovalsConfig,
+    });
+    if (execApprovalsEnabled) {
+      registerChannelRuntimeContext({
+        channelRuntime: opts.channelRuntime,
+        channelId: "discord",
+        accountId: account.accountId,
+        capability: CHANNEL_APPROVAL_NATIVE_RUNTIME_CONTEXT_CAPABILITY,
+        context: {
           token,
-          accountId: account.accountId,
           config: execApprovalsConfig,
-          cfg,
-          runtime,
-        })
-      : null;
+        },
+        abortSignal: opts.abortSignal,
+      });
+    }
 
     const agentComponentsConfig = discordCfg.agentComponents ?? {};
     const agentComponentsEnabled = agentComponentsConfig.enabled ?? true;
@@ -866,8 +887,16 @@ export async function monitorDiscordProvider(opts: MonitorDiscordOpts = {}) {
     ];
     const modals: Modal[] = [];
 
-    if (execApprovalsHandler) {
-      components.push(createExecApprovalButton({ handler: execApprovalsHandler }));
+    if (execApprovalsEnabled) {
+      components.push(
+        createExecApprovalButton(
+          createDiscordExecApprovalButtonContext({
+            cfg,
+            accountId: account.accountId,
+            config: execApprovalsConfig,
+          }),
+        ),
+      );
     }
 
     if (agentComponentsEnabled) {
@@ -892,69 +921,33 @@ export async function monitorDiscordProvider(opts: MonitorDiscordOpts = {}) {
       modals.push(createDiscordComponentModal(componentContext));
     }
 
-    class DiscordStatusReadyListener extends ReadyListener {
-      async handle(_data: unknown, client: Client) {
-        if (autoPresenceController?.enabled) {
-          autoPresenceController.refresh();
-          return;
-        }
-
-        const gateway = client.getPlugin<GatewayPlugin>("gateway");
-        if (!gateway) {
-          return;
-        }
-
-        const presence = resolveDiscordPresenceUpdate(discordCfg);
-        if (!presence) {
-          return;
-        }
-
-        gateway.updatePresence(presence);
-      }
-    }
-
-    const clientPlugins: Plugin[] = [
-      (createDiscordGatewayPluginForTesting ?? createDiscordGatewayPlugin)({
-        discordConfig: discordCfg,
-        runtime,
-      }),
-    ];
-    if (voiceEnabled) {
-      clientPlugins.push(new VoicePlugin());
-    }
-    // Pass eventQueue config to Carbon so the gateway listener budget can be tuned.
-    // Default listenerTimeout is 120s (Carbon defaults to 30s, which is too short for some
-    // Discord normalization/enqueue work).
-    const eventQueueOpts = {
-      listenerTimeout: 120_000,
-      ...discordCfg.eventQueue,
-    };
-    const client = (createClientForTesting ?? ((...args) => new Client(...args)))(
-      {
-        baseUrl: "http://localhost",
-        deploySecret: "a",
-        clientId: applicationId,
-        publicKey: "a",
-        token,
-        autoDeploy: false,
-        eventQueue: eventQueueOpts,
-      },
-      {
-        commands,
-        listeners: [new DiscordStatusReadyListener()],
-        components,
-        modals,
-      },
-      clientPlugins,
-    );
-    lifecycleGateway = client.getPlugin<GatewayPlugin>("gateway");
-    gatewaySupervisor = (
-      createDiscordGatewaySupervisorForTesting ?? createDiscordGatewaySupervisor
-    )({
-      gateway: lifecycleGateway,
-      isDisallowedIntentsError: isDiscordDisallowedIntentsError,
+    const {
+      client,
+      gateway,
+      gatewaySupervisor: createdGatewaySupervisor,
+      autoPresenceController: createdAutoPresenceController,
+      eventQueueOpts,
+    } = createDiscordMonitorClient({
+      accountId: account.accountId,
+      applicationId,
+      token,
+      proxyFetch: discordProxyFetch,
+      commands,
+      components,
+      modals,
+      voiceEnabled,
+      discordConfig: discordCfg,
       runtime,
+      createClient: createClientForTesting ?? ((...args) => new Client(...args)),
+      createGatewayPlugin: createDiscordGatewayPluginForTesting ?? createDiscordGatewayPlugin,
+      createGatewaySupervisor:
+        createDiscordGatewaySupervisorForTesting ?? createDiscordGatewaySupervisor,
+      createAutoPresenceController: createDiscordAutoPresenceController,
+      isDisallowedIntentsError: isDiscordDisallowedIntentsError,
     });
+    lifecycleGateway = gateway;
+    gatewaySupervisor = createdGatewaySupervisor;
+    autoPresenceController = createdAutoPresenceController;
 
     earlyGatewayEmitter = gatewaySupervisor.emitter;
     onEarlyGatewayDebug = (msg: unknown) => {
@@ -966,15 +959,6 @@ export async function monitorDiscordProvider(opts: MonitorDiscordOpts = {}) {
       );
     };
     earlyGatewayEmitter?.on("debug", onEarlyGatewayDebug);
-    if (lifecycleGateway) {
-      autoPresenceController = createDiscordAutoPresenceController({
-        accountId: account.accountId,
-        discordConfig: discordCfg,
-        gateway: lifecycleGateway,
-        log: (message) => runtime.log?.(message),
-      });
-      autoPresenceController.start();
-    }
 
     logDiscordStartupPhase({
       runtime,
@@ -1004,8 +988,19 @@ export async function monitorDiscordProvider(opts: MonitorDiscordOpts = {}) {
       string,
       import("openclaw/plugin-sdk/reply-history").HistoryEntry[]
     >();
-    let botUserId: string | undefined;
-    let botUserName: string | undefined;
+    let { botUserId, botUserName } = await fetchDiscordBotIdentity({
+      client,
+      runtime,
+      logStartupPhase: (phase, details) =>
+        logDiscordStartupPhase({
+          runtime,
+          accountId: account.accountId,
+          phase,
+          startAt: startupStartedAt,
+          gateway: lifecycleGateway,
+          details,
+        }),
+    });
     let voiceManager: DiscordVoiceManager | null = null;
 
     if (nativeDisabledExplicit) {
@@ -1027,37 +1022,6 @@ export async function monitorDiscordProvider(opts: MonitorDiscordOpts = {}) {
         phase: "clear-native-commands:done",
         startAt: startupStartedAt,
         gateway: lifecycleGateway,
-      });
-    }
-
-    logDiscordStartupPhase({
-      runtime,
-      accountId: account.accountId,
-      phase: "fetch-bot-identity:start",
-      startAt: startupStartedAt,
-      gateway: lifecycleGateway,
-    });
-    try {
-      const botUser = await client.fetchUser("@me");
-      botUserId = botUser?.id;
-      botUserName = botUser?.username?.trim() || botUser?.globalName?.trim() || undefined;
-      logDiscordStartupPhase({
-        runtime,
-        accountId: account.accountId,
-        phase: "fetch-bot-identity:done",
-        startAt: startupStartedAt,
-        gateway: lifecycleGateway,
-        details: `botUserId=${botUserId ?? "<missing>"} botUserName=${botUserName ?? "<missing>"}`,
-      });
-    } catch (err) {
-      runtime.error?.(danger(`discord: failed to fetch bot identity: ${String(err)}`));
-      logDiscordStartupPhase({
-        runtime,
-        accountId: account.accountId,
-        phase: "fetch-bot-identity:error",
-        startAt: startupStartedAt,
-        gateway: lifecycleGateway,
-        details: String(err),
       });
     }
 
@@ -1105,47 +1069,33 @@ export async function monitorDiscordProvider(opts: MonitorDiscordOpts = {}) {
           opts.setStatus?.({ lastEventAt: at, lastInboundAt: at });
         }
       : undefined;
-
-    registerDiscordListener(
-      client.listeners,
-      new DiscordMessageListener(messageHandler, logger, trackInboundEvent, {
-        timeoutMs: eventQueueOpts.listenerTimeout,
-      }),
-    );
-    const reactionListenerOptions = {
+    registerDiscordMonitorListeners({
       cfg,
+      client,
       accountId: account.accountId,
+      discordConfig: discordCfg,
       runtime,
       botUserId,
       dmEnabled,
       groupDmEnabled,
-      groupDmChannels: groupDmChannels ?? [],
+      groupDmChannels,
       dmPolicy,
-      allowFrom: allowFrom ?? [],
+      allowFrom,
       groupPolicy,
-      allowNameMatching: isDangerousNameMatchingEnabled(discordCfg),
       guildEntries,
       logger,
-      onEvent: trackInboundEvent,
-    };
-    registerDiscordListener(client.listeners, new DiscordReactionListener(reactionListenerOptions));
-    registerDiscordListener(
-      client.listeners,
-      new DiscordReactionRemoveListener(reactionListenerOptions),
-    );
+      messageHandler,
+      trackInboundEvent,
+      eventQueueListenerTimeoutMs: eventQueueOpts.listenerTimeout,
+    });
 
-    registerDiscordListener(
-      client.listeners,
-      new DiscordThreadUpdateListener(cfg, account.accountId, logger),
-    );
-
-    if (discordCfg.intents?.presence) {
-      registerDiscordListener(
-        client.listeners,
-        new DiscordPresenceListener({ logger, accountId: account.accountId }),
-      );
-      runtime.log?.("discord: GuildPresences intent enabled — presence listener registered");
-    }
+    logDiscordStartupPhase({
+      runtime,
+      accountId: account.accountId,
+      phase: "client-start",
+      startAt: startupStartedAt,
+      gateway: lifecycleGateway,
+    });
 
     const botIdentity =
       botUserId && botUserName ? `${botUserId} (${botUserName})` : (botUserId ?? botUserName ?? "");
@@ -1171,7 +1121,6 @@ export async function monitorDiscordProvider(opts: MonitorDiscordOpts = {}) {
       isDisallowedIntentsError: isDiscordDisallowedIntentsError,
       voiceManager,
       voiceManagerRef,
-      execApprovalsHandler,
       threadBindings,
       gatewaySupervisor,
     });
@@ -1275,3 +1224,5 @@ export const __testing = {
     shouldLogVerboseForTesting = mock;
   },
 };
+
+export const resolveDiscordRuntimeGroupPolicy = resolveOpenProviderRuntimeGroupPolicy;
